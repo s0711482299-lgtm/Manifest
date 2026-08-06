@@ -1,5 +1,14 @@
 #!/bin/bash
 
+# Source secrets if available
+if [ -f "$HOME/.secrets" ]; then
+    source "$HOME/.secrets"
+elif [ -f "$(pwd)/.secrets" ]; then
+    source "$(pwd)/.secrets"
+else
+    echo "⚠️ Warning: .secrets file not found in $HOME or $(pwd)"
+fi
+
 # =========================================================
 # CONFIGURATION (LG V60 ThinQ - timelm / Android 16.2)
 # =========================================================
@@ -11,6 +20,67 @@ export TZ="Asia/Jakarta"
 export BUILD_USERNAME="s0711482299"
 export BUILD_HOSTNAME="crave-builder"
 export USE_CCACHE=0
+
+# =========================================================
+# TELEGRAM FUNCTIONS
+# =========================================================
+
+send_telegram() {
+  local chat_id="$1"
+  local message="$2"
+  local _TK="$TG_BOT_TOKEN"
+
+  if [ -z "$_TK" ] || [ -z "$chat_id" ]; then
+    echo "⚠️ Telegram credentials missing. Skipping notification."
+    return 0
+  fi
+
+  local escaped_message
+  escaped_message=$(echo "$message" | sed \
+    -e 's/\*/\*TEMP\*/g' \
+    -e 's/_/\_TEMP\_/g' \
+    -e 's/\[/\\[/g' -e 's/\]/\\]/g' \
+    -e 's/(/\\(/g' -e 's/)/\\)/g' \
+    -e 's/~/\\~/g' -e 's/`/\\`/g' \
+    -e 's/>/\\>/g' -e 's/#/\\#/g' \
+    -e 's/+/\\+/g' -e 's/-/\\-/g' \
+    -e 's/=/\\=/g' -e 's/|/\\|/g' \
+    -e 's/{/\\{/g' -e 's/}/\\}/g' \
+    -e 's/\./\\./g' -e 's/!/\\!/g' \
+    -e 's/\*TEMP\*/\*/g' \
+    -e 's/\_TEMP\_/\_/g')
+
+  echo -e "\n[$(date '+%Y-%m-%d %H:%M:%S')] Sending Telegram message to ${chat_id}"
+  curl -s -X POST "https://api.telegram.org/bot${_TK}/sendMessage" \
+    --data-urlencode "chat_id=${chat_id}" \
+    --data-urlencode "text=${escaped_message}" \
+    -d "parse_mode=MarkdownV2" \
+    -d "disable_web_page_preview=true" > /dev/null
+}
+
+send_telegram_file() {
+  local chat_id="$1"
+  local file_path="$2"
+  local caption="$3"
+  local _TK="$TG_BOT_TOKEN"
+
+  if [ -z "$_TK" ] || [ -z "$chat_id" ]; then
+    echo "⚠️ Telegram credentials missing. Skipping document upload."
+    return 0
+  fi
+
+  if [ ! -f "$file_path" ]; then
+    echo "Error: File $file_path not found!"
+    return 1
+  fi
+
+  echo -e "\n[$(date '+%Y-%m-%d %H:%M:%S')] Sending document to Telegram (${chat_id})"
+
+  curl -s -X POST "https://api.telegram.org/bot${_TK}/sendDocument" \
+    -F "chat_id=${chat_id}" \
+    -F "document=@${file_path}" \
+    -F "caption=${caption}" > /dev/null
+}
 
 format_duration() {
     local T=$1
@@ -27,13 +97,15 @@ format_duration() {
 start_build_process() {
     START_TIME=$(date +%s)
 
-    echo "================================================="
-    echo "⚙️ Starting ROM Compilation"
-    echo "ROM: $BUILD_TARGET"
-    echo "Android: $ANDROID_VERSION"
-    echo "Device: $DEVICE_CODE (LG V60 ThinQ)"
-    echo "Start Time: $(date '+%Y-%m-%d %H:%M:%S %Z')"
-    echo "================================================="
+    local initial_msg="⚙️ *ROM Build Started!*
+
+*ROM:* $BUILD_TARGET
+*Android:* $ANDROID_VERSION
+*Device:* $DEVICE_CODE \\(LG V60 ThinQ\\)
+*Start Time:* $(date '+%Y-%m-%d %H:%M:%S %Z')"
+
+    send_telegram "$TG_BUILD_CHAT_ID" "$initial_msg"
+    echo "Build Started at $(date '+%Y-%m-%d %H:%M:%S')"
 
     # 1. Initialize DerpFest Android 16.2 Manifest
     echo "Initializing DerpFest 16.2 manifest..."
@@ -68,36 +140,24 @@ start_build_process() {
 </manifest>
 EOF
 
-    # 4. Sync Sources (Crave Resync with Repo Sync Fallback)
+    # 4. Sync Sources using Crave Resync
     echo "Syncing repositories..."
-    if [ -f "/opt/crave/resync.sh" ]; then
-        echo "Found Crave resync script. Running /opt/crave/resync.sh..."
-        /opt/crave/resync.sh
-    else
-        echo "⚠️ /opt/crave/resync.sh not found. Falling back to standard repo sync..."
-        repo sync -c -j$(nproc --all) --force-sync --no-clone-bundle --no-tags
-    fi
+    /opt/crave/resync.sh
 
-    # 5. Verify source sync success
-    if [ ! -f "build/envsetup.sh" ]; then
-        echo "❌ Critical Error: Source tree failed to sync (build/envsetup.sh missing)."
-        exit 1
-    fi
-
-    # 6. Legacy library symlinks fix for build tools
+    # 5. Legacy library symlinks fix for build tools
     sudo ln -sf /usr/lib/x86_64-linux-gnu/libncurses.so.6 /usr/lib/x86_64-linux-gnu/libncurses.so.5 2>/dev/null || true
     sudo ln -sf /usr/lib/x86_64-linux-gnu/libtinfo.so.6 /usr/lib/x86_64-linux-gnu/libtinfo.so.5 2>/dev/null || true
 
     echo "Tree setup complete."
 
-    # 7. Environment Setup & Lunch
+    # 6. Environment Setup & Lunch
     . build/envsetup.sh
     echo "Setting lunch target for LG V60..."
     lunch derp_timelm-bp4a-userdebug || lunch derp_timelm-userdebug
 
     make installclean
 
-    # 8. Execute Build
+    # 7. Execute Build
     echo "========================="
     echo "Starting ROM Compilation..."
     echo "========================="
@@ -109,16 +169,33 @@ EOF
     DURATION=$((END_TIME - START_TIME))
     DURATION_FORMATTED=$(format_duration $DURATION)
 
-    echo "================================================="
     if [[ $BUILD_STATUS -eq 0 ]]; then
-        echo "✅ Build Finished Successfully!"
+        local status_icon="✅"
+        local status_text="Success"
+        LOG_FILE="log.txt"
     else
-        echo "❌ Build Failed with exit code: $BUILD_STATUS"
+        local status_icon="❌"
+        local status_text="Failure (Exit Code: $BUILD_STATUS)"
+        LOG_FILE="out/error.log"
+        [ ! -f "$LOG_FILE" ] && LOG_FILE="log.txt"
     fi
-    echo "ROM: $BUILD_TARGET"
-    echo "Device: $DEVICE_CODE"
-    echo "Duration: $DURATION_FORMATTED"
-    echo "================================================="
+
+    # 8. Send Final Status to Telegram
+    local final_msg="${status_icon} *Build Finished!*
+
+*ROM:* $BUILD_TARGET
+*Android:* $ANDROID_VERSION
+*Device:* $DEVICE_CODE
+*Duration:* $DURATION_FORMATTED
+*Status:* $status_text"
+
+    send_telegram "$TG_BUILD_CHAT_ID" "$final_msg"
+
+    if [[ -f "$LOG_FILE" ]]; then
+        send_telegram_file "$TG_BUILD_CHAT_ID" "$LOG_FILE" "Build Logs"
+    else
+        send_telegram "$TG_BUILD_CHAT_ID" "⚠️ Warning: Log file ${LOG_FILE} not found."
+    fi
 
     # 9. Upload Artifacts on Success
     if [[ $BUILD_STATUS -eq 0 ]]; then
